@@ -709,6 +709,7 @@ int osmo_stream_srv_recv(struct osmo_stream_srv *conn, struct msgb *msg)
 		return ret;
 	}
 	msgb_put(msg, ret);
-	LOGP(DLINP, LOGL_DEBUG, "received %d bytes from client\n", ret);
+	LOGP(DLINP, LOGL_DEBUG, "received %d bytes from client\n%s\n", ret,
+	     osmo_hexdump(msgb_data(msg), ret));
 	return ret;
 }
