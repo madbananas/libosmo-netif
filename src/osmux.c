@@ -49,6 +49,11 @@
 
 static void *osmux_ctx;
 
+static bool seq_before(uint32_t seq1, uint32_t seq2)
+{
+        return (int32_t)(seq1-seq2) < 0;
+}
+
 static uint32_t osmux_get_payload_len(struct osmux_hdr *osmuxh)
 {
 	return osmo_amr_bytes(osmuxh->amr_ft) * (osmuxh->ctr+1);
@@ -207,6 +212,9 @@ struct osmux_circuit {
 	struct llist_head	msg_list;
 	int			nmsgs;
 	int			dummy;
+	uint16_t		last_snd_sequence;
+	uint32_t		last_snd_timestamp;
+	bool			first_queued;
 };
 
 static int osmux_batch_enqueue(struct msgb *msg, struct osmux_circuit *circuit,
@@ -458,25 +466,15 @@ static int osmux_rtp_amr_payload_len(struct msgb *msg, struct rtp_hdr *rtph)
 	return amr_payload_len;
 }
 
-static void osmux_replay_lost_packets(struct osmux_circuit *circuit,
-				      struct rtp_hdr *cur_rtph, int batch_factor)
+static int
+osmux_replay_lost_packets(struct osmux_circuit *circuit,  struct msgb *msg,
+			  struct rtp_hdr *cur_rtph, int batch_factor)
 {
 	int16_t diff;
-	struct msgb *last;
 	struct rtp_hdr *rtph;
 	int i;
 
-	/* Have we see any RTP packet in this batch before? */
-	if (llist_empty(&circuit->msg_list))
-		return;
-
-	/* Get last RTP packet seen in this batch */
-	last = llist_entry(circuit->msg_list.prev, struct msgb, list);
-	rtph = osmo_rtp_get_hdr(last);
-	if (rtph == NULL)
-		return;
-
-	diff = ntohs(cur_rtph->sequence) - ntohs(rtph->sequence);
+	diff = ntohs(cur_rtph->sequence) - ntohs(circuit->last_snd_sequence);
 
 	/* Lifesaver: make sure bugs don't spawn lots of clones */
 	if (diff > 16)
@@ -489,29 +487,33 @@ static void osmux_replay_lost_packets(struct osmux_circuit *circuit,
 		struct msgb *clone;
 
 		/* Clone last RTP packet seen */
-		clone = msgb_alloc(last->data_len, "RTP clone");
+		clone = msgb_alloc(msg->data_len, "RTP clone");
 		if (!clone)
 			continue;
 
-		memcpy(clone->data, last->data, last->len);
-		msgb_put(clone, last->len);
+		memcpy(clone->data, msg->data, msg->len);
+		msgb_put(clone, msg->len);
 
 		/* The original RTP message has been already sanity check. */
 		rtph = osmo_rtp_get_hdr(clone);
 
 		/* Adjust sequence number and timestamp */
-		rtph->sequence = htons(ntohs(rtph->sequence) + i);
-		rtph->timestamp = htonl(ntohl(rtph->timestamp) +
+		rtph->sequence = htons(ntohs(circuit->last_snd_sequence) + i);
+		rtph->timestamp = htonl(ntohl(circuit->last_snd_timestamp) +
 					DELTA_RTP_TIMESTAMP);
 
 		/* No more room in this batch, skip padding with more clones */
 		if (osmux_batch_enqueue(clone, circuit, batch_factor) < 0) {
 			msgb_free(clone);
-			break;
+			return 1;
 		}
 
 		LOGP(DLMIB, LOGL_ERROR, "adding cloned RTP\n");
+		circuit->last_snd_sequence = rtph->sequence;
+		circuit->last_snd_timestamp = rtph->timestamp;
+
 	}
+	return 0;
 }
 
 static struct osmux_circuit *
@@ -607,6 +609,7 @@ osmux_batch_add(struct osmux_batch *batch, uint32_t batch_factor, struct msgb *m
 	/* Extra validation: check if this message already exists, should not
 	 * happen but make sure we don't propagate duplicated messages.
 	 */
+	 /* FIXME: overwrite old packet with new one as the old one was probably lost & cloned */
 	llist_for_each_entry(cur, &circuit->msg_list, list) {
 		struct rtp_hdr *rtph2 = osmo_rtp_get_hdr(cur);
 		if (rtph2 == NULL)
@@ -620,8 +623,16 @@ osmux_batch_add(struct osmux_batch *batch, uint32_t batch_factor, struct msgb *m
 			return -1;
 		}
 	}
+
+	/* Avoid going further if the packet is old, drop the packet */
+	if (circuit->first_queued &&
+	    seq_before(ntohs(rtph->sequence), ntohs(circuit->last_snd_sequence)))
+		return -1;
+
 	/* Handle RTP packet loss scenario */
-	osmux_replay_lost_packets(circuit, rtph, batch_factor);
+	if (circuit->first_queued &&
+	    osmux_replay_lost_packets(circuit, msg, rtph, batch_factor) > 0)
+		return 1;
 
 	/* This batch is full, force batch delivery */
 	if (osmux_batch_enqueue(msg, circuit, batch_factor) < 0)
@@ -644,6 +655,10 @@ osmux_batch_add(struct osmux_batch *batch, uint32_t batch_factor, struct msgb *m
 	}
 	batch->nmsgs++;
 
+	/* Update circuit state */
+	circuit->last_snd_sequence = rtph->sequence;
+	circuit->last_snd_timestamp = rtph->timestamp;
+	circuit->first_queued = true;
 	return 0;
 }
 
